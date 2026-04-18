@@ -26,8 +26,8 @@ Each exchange client runs as an independent producer task. A single consumer dra
 **Requires:** Docker + Docker Compose.
 
 ```bash
-git clone https://github.com/Pavel-Karpenko/traging-collector.git
-cd traging-collector
+git clone https://github.com/Pavel-Karpenko/trading-collector.git
+cd trading-collector
 docker compose up --build
 ```
 
