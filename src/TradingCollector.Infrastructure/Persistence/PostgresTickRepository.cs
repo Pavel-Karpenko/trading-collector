@@ -73,10 +73,19 @@ public sealed class PostgresTickRepository : ITickRepository
         await writer.CompleteAsync(cancellationToken);
     }
 
+    // Connection is disposed on failure — no native resource leak on OpenAsync exception (#7)
     private async Task<NpgsqlConnection> OpenConnectionAsync(CancellationToken ct)
     {
         var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(ct);
-        return conn;
+        try
+        {
+            await conn.OpenAsync(ct);
+            return conn;
+        }
+        catch
+        {
+            await conn.DisposeAsync();
+            throw;
+        }
     }
 }

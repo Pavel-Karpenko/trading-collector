@@ -33,6 +33,10 @@ public sealed class TickAggregationService : BackgroundService
     private readonly ConcurrentDictionary<string, long> _perSourceProcessed = new();
     private readonly ConcurrentDictionary<string, long> _perSourceDuplicates = new();
 
+    // Pre-allocated batch buffers — swapped on each flush to avoid per-flush list allocations (#8)
+    private List<Tick> _batch = new(BatchSize);
+    private List<Tick> _standby = new(BatchSize);
+
     public TickAggregationService(
         IEnumerable<IExchangeClient> clients,
         ITickRepository repository,
@@ -51,11 +55,12 @@ public sealed class TickAggregationService : BackgroundService
 
         var tasks = new List<Task>();
 
+        // I/O-bound async methods don't need Task.Run (#10)
         foreach (var client in _clients)
-            tasks.Add(Task.Run(() => ProduceAsync(client, stoppingToken), stoppingToken));
+            tasks.Add(ProduceAsync(client, stoppingToken));
 
-        tasks.Add(Task.Run(() => ConsumeAsync(stoppingToken), stoppingToken));
-        tasks.Add(Task.Run(() => LogStatsAsync(stoppingToken), stoppingToken));
+        tasks.Add(ConsumeAsync(stoppingToken));
+        tasks.Add(LogStatsAsync(stoppingToken));
 
         await Task.WhenAll(tasks);
     }
@@ -91,23 +96,24 @@ public sealed class TickAggregationService : BackgroundService
 
     private async Task ConsumeAsync(CancellationToken ct)
     {
-        var batch = new List<Tick>(BatchSize);
-
-        using var timer = new PeriodicTimer(FlushInterval);
-
         try
         {
-            while (await timer.WaitForNextTickAsync(ct))
+            while (!ct.IsCancellationRequested)
             {
+                // Event-driven: react immediately when data arrives, or wake after flush interval (#6)
+                await Task.WhenAny(
+                    _channel.Reader.WaitToReadAsync(ct).AsTask(),
+                    Task.Delay(FlushInterval, ct));
+
                 while (_channel.Reader.TryRead(out var tick))
                 {
-                    batch.Add(tick);
-                    if (batch.Count >= BatchSize)
-                        await FlushAsync(batch, ct);
+                    _batch.Add(tick);
+                    if (_batch.Count >= BatchSize)
+                        await FlushAsync(ct);
                 }
 
-                if (batch.Count > 0)
-                    await FlushAsync(batch, ct);
+                if (_batch.Count > 0)
+                    await FlushAsync(ct);
             }
         }
         catch (OperationCanceledException) { }
@@ -118,32 +124,37 @@ public sealed class TickAggregationService : BackgroundService
 
         // Final drain after cancellation
         while (_channel.Reader.TryRead(out var remaining))
-            batch.Add(remaining);
+            _batch.Add(remaining);
 
-        if (batch.Count > 0)
-            await FlushAsync(batch, CancellationToken.None);
+        if (_batch.Count > 0)
+            await FlushAsync(CancellationToken.None);
     }
 
-    private async Task FlushAsync(List<Tick> batch, CancellationToken ct)
+    private async Task FlushAsync(CancellationToken ct)
     {
-        if (batch.Count == 0)
+        if (_batch.Count == 0)
             return;
 
-        var snapshot = new List<Tick>(batch);
-        batch.Clear();
+        // Swap buffers: consumer continues filling the empty standby while we persist (#8)
+        (_batch, _standby) = (_standby, _batch);
+        var toSave = _standby;
 
         try
         {
-            await _repository.SaveBatchAsync(snapshot, ct);
-            Interlocked.Add(ref _totalProcessed, snapshot.Count);
+            // Data preserved until save succeeds — not discarded before the attempt (#2)
+            await _repository.SaveBatchAsync(toSave, ct);
+            Interlocked.Add(ref _totalProcessed, toSave.Count);
 
-            // Update per-source counters
-            foreach (var tick in snapshot)
+            foreach (var tick in toSave)
                 _perSourceProcessed.AddOrUpdate(tick.Source, 1, (_, v) => v + 1);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to save batch of {Count} ticks", snapshot.Count);
+            _logger.LogError(ex, "Failed to save batch of {Count} ticks", toSave.Count);
+        }
+        finally
+        {
+            toSave.Clear(); // cleared after save attempt, not before (#2)
         }
     }
 

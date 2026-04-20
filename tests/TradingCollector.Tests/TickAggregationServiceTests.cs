@@ -32,7 +32,14 @@ public sealed class TickAggregationServiceTests
     public async Task Ticks_ArePersistedToRepository()
     {
         // Arrange
+        var allSaved = new List<Tick>();
         var repository = Substitute.For<ITickRepository>();
+
+        // Capture during the call — before the reusable batch buffer is cleared after save
+        repository
+            .When(r => r.SaveBatchAsync(Arg.Any<IReadOnlyList<Tick>>(), Arg.Any<CancellationToken>()))
+            .Do(call => allSaved.AddRange(call.Arg<IReadOnlyList<Tick>>()));
+
         var dedup = new TickDeduplicator();
         var logger = NullLogger<TickAggregationService>.Instance;
 
@@ -49,9 +56,7 @@ public sealed class TickAggregationServiceTests
 
         // Assert
         await repository.Received(1).InitializeAsync(Arg.Any<CancellationToken>());
-        await repository.Received().SaveBatchAsync(
-            Arg.Is<IReadOnlyList<Tick>>(list => list.Any(t => t.Ticker == "BTCUSDT" && t.Source == "TestExchange")),
-            Arg.Any<CancellationToken>());
+        allSaved.Should().Contain(t => t.Ticker == "BTCUSDT" && t.Source == "TestExchange");
     }
 
     [Fact]

@@ -13,8 +13,9 @@ namespace TradingCollector.Infrastructure.Exchange;
 /// Message format:
 ///   {"channel":"trade","type":"update","data":[
 ///     {"symbol":"BTC/USD","side":"buy","price":45000.50,"qty":0.001,
-///      "timestamp":"2024-04-16T10:00:00.000000Z"}
+///      "timestamp":"2024-04-16T10:00:00.000000Z"}, ...
 ///   ]}
+/// Kraken batches multiple trades per message — all entries are yielded (#1).
 /// </summary>
 public class KrakenExchangeClient : WebSocketExchangeClientBase
 {
@@ -43,37 +44,39 @@ public class KrakenExchangeClient : WebSocketExchangeClientBase
         Logger.LogDebug("[{Exchange}] Subscribed to trade channel for {Symbol}", Name, _symbol);
     }
 
-    protected override Tick? ParseMessage(string message)
+    protected override IEnumerable<Tick> ParseMessages(string message)
     {
         using var doc = JsonDocument.Parse(message);
         var root = doc.RootElement;
 
         if (!root.TryGetProperty("channel", out var channel) || channel.GetString() != "trade")
-            return null;
+            yield break;
 
-        if (!root.TryGetProperty("data", out var dataArr) || dataArr.GetArrayLength() == 0)
-            return null;
+        if (!root.TryGetProperty("data", out var dataArr))
+            yield break;
 
-        var entry = dataArr[0];
-
-        var symbol = entry.GetProperty("symbol").GetString()!;
-        // Normalize "BTC/USD" → "BTCUSD"
-        var ticker = symbol.Replace("/", string.Empty);
-
-        var price = entry.GetProperty("price").GetDecimal();
-        var volume = entry.GetProperty("qty").GetDecimal();
-
-        // Kraken returns ISO 8601 timestamp string
-        var timestampStr = entry.GetProperty("timestamp").GetString()!;
-        var timestamp = DateTimeOffset.Parse(timestampStr, null, System.Globalization.DateTimeStyles.RoundtripKind);
-
-        return new Tick
+        // Yield every trade in the batch (#1)
+        foreach (var entry in dataArr.EnumerateArray())
         {
-            Ticker = ticker,
-            Price = price,
-            Volume = volume,
-            Timestamp = timestamp,
-            Source = Name,
-        };
+            var symbol = entry.GetProperty("symbol").GetString()!;
+            // Normalize "BTC/USD" → "BTCUSD"
+            var ticker = symbol.Replace("/", string.Empty);
+
+            var price = entry.GetProperty("price").GetDecimal();
+            var volume = entry.GetProperty("qty").GetDecimal();
+
+            // Kraken returns ISO 8601 timestamp string
+            var timestampStr = entry.GetProperty("timestamp").GetString()!;
+            var timestamp = DateTimeOffset.Parse(timestampStr, null, System.Globalization.DateTimeStyles.RoundtripKind);
+
+            yield return new Tick
+            {
+                Ticker = ticker,
+                Price = price,
+                Volume = volume,
+                Timestamp = timestamp,
+                Source = Name,
+            };
+        }
     }
 }

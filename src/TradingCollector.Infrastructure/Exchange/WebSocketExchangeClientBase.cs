@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -10,7 +11,7 @@ namespace TradingCollector.Infrastructure.Exchange;
 
 /// <summary>
 /// Base WebSocket exchange client with automatic reconnection and exponential backoff.
-/// Subclasses implement <see cref="ParseMessage"/> and optionally <see cref="OnConnectedAsync"/>.
+/// Subclasses implement <see cref="ParseMessages"/> and optionally <see cref="OnConnectedAsync"/>.
 ///
 /// The stream is implemented via an internal Channel to avoid C# CS1626
 /// (yield is not allowed inside try/catch blocks).
@@ -19,6 +20,7 @@ public abstract class WebSocketExchangeClientBase : IExchangeClient
 {
     private readonly ExchangeConfig _config;
     protected readonly ILogger Logger;
+
     protected WebSocketExchangeClientBase(ExchangeConfig config, ILogger logger)
     {
         _config = config;
@@ -107,15 +109,16 @@ public abstract class WebSocketExchangeClientBase : IExchangeClient
     private async Task ReceiveAndWriteAsync(ClientWebSocket ws, ChannelWriter<Tick> writer, CancellationToken ct)
     {
         var buffer = new byte[8192];
-        var sb = new StringBuilder();
+        // Reused across messages — accumulates raw bytes, decoded once per message (#9)
+        var ms = new MemoryStream(8192);
 
         while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
         {
-            sb.Clear();
+            ms.SetLength(0);
             WebSocketReceiveResult result;
             bool closed = false;
 
-            // ── Receive full message ──────────────────────────────────────────
+            // ── Receive full message (may span multiple frames) ───────────────
             try
             {
                 do
@@ -129,7 +132,8 @@ public abstract class WebSocketExchangeClientBase : IExchangeClient
                         break;
                     }
 
-                    sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                    // Accumulate bytes; single UTF-8 decode after all frames arrive (#9)
+                    ms.Write(buffer, 0, result.Count);
                 }
                 while (!result.EndOfMessage);
             }
@@ -145,20 +149,21 @@ public abstract class WebSocketExchangeClientBase : IExchangeClient
             if (closed)
                 return;
 
-            var raw = sb.ToString();
+            var raw = Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
 
-            // ── Parse ─────────────────────────────────────────────────────────
-            Tick? tick = null;
+            // ── Parse — one message may contain multiple ticks (#5) ───────────
+            List<Tick> ticks;
             try
             {
-                tick = ParseMessage(raw);
+                ticks = ParseMessages(raw).ToList();
             }
             catch (Exception ex)
             {
                 Logger.LogDebug(ex, "[{Exchange}] Parse error: {Raw}", Name, raw);
+                continue;
             }
 
-            if (tick is not null)
+            foreach (var tick in ticks)
                 await writer.WriteAsync(tick, ct);
         }
     }
@@ -166,8 +171,11 @@ public abstract class WebSocketExchangeClientBase : IExchangeClient
     /// <summary>Called once after successful connect. Override to send subscription frames.</summary>
     protected virtual Task OnConnectedAsync(ClientWebSocket ws, CancellationToken ct) => Task.CompletedTask;
 
-    /// <summary>Parse a raw WebSocket text message into a Tick. Return null to skip.</summary>
-    protected abstract Tick? ParseMessage(string message);
+    /// <summary>
+    /// Parse a raw WebSocket text message into zero or more ticks.
+    /// Return an empty enumerable to skip the message.
+    /// </summary>
+    protected abstract IEnumerable<Tick> ParseMessages(string message);
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

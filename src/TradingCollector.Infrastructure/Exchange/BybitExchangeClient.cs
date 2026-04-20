@@ -12,7 +12,8 @@ namespace TradingCollector.Infrastructure.Exchange;
 /// After connecting, sends a subscribe frame for publicTrade.{SYMBOL}.
 /// Message format:
 ///   {"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1713271200000,
-///    "data":[{"T":1713271200000,"s":"BTCUSDT","p":"45000.50","v":"0.001","S":"Buy"}]}
+///    "data":[{"T":1713271200000,"s":"BTCUSDT","p":"45000.50","v":"0.001","S":"Buy"}, ...]}
+/// Bybit batches multiple trades per message under load — all entries are yielded (#1).
 /// </summary>
 public class BybitExchangeClient : WebSocketExchangeClientBase
 {
@@ -37,34 +38,33 @@ public class BybitExchangeClient : WebSocketExchangeClientBase
         Logger.LogDebug("[{Exchange}] Subscribed to publicTrade.{Symbol}", Name, _symbol);
     }
 
-    protected override Tick? ParseMessage(string message)
+    protected override IEnumerable<Tick> ParseMessages(string message)
     {
         using var doc = JsonDocument.Parse(message);
         var root = doc.RootElement;
 
         // Confirmation / ping frames have no "data" array
         if (!root.TryGetProperty("topic", out _) || !root.TryGetProperty("data", out var dataArr))
-            return null;
+            yield break;
 
-        // Bybit sends arrays; take the first trade entry
-        if (dataArr.GetArrayLength() == 0)
-            return null;
-
-        var entry = dataArr[0];
-        var ticker = entry.GetProperty("s").GetString()!;
-        var price = decimal.Parse(entry.GetProperty("p").GetString()!,
-            System.Globalization.CultureInfo.InvariantCulture);
-        var volume = decimal.Parse(entry.GetProperty("v").GetString()!,
-            System.Globalization.CultureInfo.InvariantCulture);
-        var tsMs = entry.GetProperty("T").GetInt64();
-
-        return new Tick
+        // Yield every trade in the batch (#1)
+        foreach (var entry in dataArr.EnumerateArray())
         {
-            Ticker = ticker,
-            Price = price,
-            Volume = volume,
-            Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(tsMs),
-            Source = Name,
-        };
+            var ticker = entry.GetProperty("s").GetString()!;
+            var price = decimal.Parse(entry.GetProperty("p").GetString()!,
+                System.Globalization.CultureInfo.InvariantCulture);
+            var volume = decimal.Parse(entry.GetProperty("v").GetString()!,
+                System.Globalization.CultureInfo.InvariantCulture);
+            var tsMs = entry.GetProperty("T").GetInt64();
+
+            yield return new Tick
+            {
+                Ticker = ticker,
+                Price = price,
+                Volume = volume,
+                Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(tsMs),
+                Source = Name,
+            };
+        }
     }
 }
